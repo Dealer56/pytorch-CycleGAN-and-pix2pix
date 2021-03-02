@@ -9,6 +9,136 @@ from torch.optim import lr_scheduler
 # Helper Functions
 ###############################################################################
 
+class EncoderNode(nn.Module):
+    """Basic Encoder Nodes."""
+    
+    def __init__(self, C_in, C_out, kernel, stride, padding, bn=True):
+        super().__init__()
+        
+        self.layers = nn.Sequential(
+            nn.Conv2d(C_in, C_out, kernel, stride, padding),
+            nn.BatchNorm2d(C_out) if bn else nn.Identity(),
+            nn.LeakyReLU(0.2)
+        )
+    
+    def forward(self, input):
+        return self.layers(input)
+
+class DecoderNode(nn.Module):
+    """Generator decoder class."""
+    def __init__(self, C_in, C_out, kernel, stride, padding, drop=True):
+        super().__init__()
+        self.deconv = nn.ConvTranspose2d(C_in, C_out,  kernel, stride, padding)
+        self.bn = nn.BatchNorm2d(C_out)
+        self.dropout = nn.Dropout2d(p=0.5, inplace=True) if drop else nn.Identity()
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, input, skip_input):
+        out = self.deconv(input)
+        out = self.bn(out)
+        out = self.dropout(out)
+        out = torch.cat([out, skip_input], dim=1) # skip connection
+        out = self.activation(out)
+        return out
+
+
+class InternalNodeA(nn.Module):
+    """Internal node (A).
+    skip_in  --> conv --> out ----- + ------> out
+                                    |
+    scale_in --> upsample ---> scale_in_2x
+    """
+    def __init__(self,  C_skip, C_scale, C_out, kernel, stride, padding, bn=True, drop=False):
+        super().__init__()
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(C_scale, C_out, kernel, stride, padding),
+            nn.ReLU(inplace=True)
+        )
+        self.conv = nn.Sequential(
+            nn.ZeroPad2d((1, 2, 1, 2)),
+            nn.Conv2d(C_skip + C_out, C_out, kernel),
+            nn.Dropout2d(0.5) if drop else nn.Identity(),
+            nn.LeakyReLU(0.2)
+        )
+        
+    def forward(self, skip_in, scale_in):
+        scale_in = self.upsample(scale_in)
+        skip_in = torch.cat([skip_in, scale_in], 1)
+        return self.conv(skip_in)
+
+class UNet_Plus_Generator_(nn.Module):
+    """Multiscale generator with 5 levels of downsampling & upsampling."""
+    
+    def __init__(self):
+        super().__init__()
+        self.encode_0_0 = EncoderNode(3, 64, 4, 2, 1)
+        self.encode_1_0 = EncoderNode(64, 128, 4, 2, 1)
+        self.encode_2_0 = EncoderNode(128, 256, 4, 2, 1)
+        self.encode_3_0 = EncoderNode(256, 512, 4, 2, 1)
+        self.encode_4_0 = EncoderNode(512, 512, 4, 2, 1)
+        
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(512, 512, 4, 2, 1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.internal_0_1 = InternalNodeA(64, 128, 64, 4, 2, 1)
+        self.internal_0_2 = InternalNodeA(64, 128, 64, 4, 2, 1)
+        self.internal_0_3 = InternalNodeA(64, 128, 64, 4, 2, 1)
+        self.internal_0_4 = InternalNodeA(64, 128, 64, 4, 2, 1)
+        
+        self.internal_1_1 = InternalNodeA(128, 256, 128, 4, 2, 1)
+        self.internal_1_2 = InternalNodeA(128, 256, 128, 4, 2, 1)
+        self.internal_1_3 = InternalNodeA(128, 256, 128, 4, 2, 1)
+        
+        self.internal_2_1 = InternalNodeA(256, 512, 256, 4, 2, 1, drop=True)
+        self.internal_2_2 = InternalNodeA(256, 512, 256, 4, 2, 1, drop=True)
+        
+        self.internal_3_1 = InternalNodeA(512, 512, 512, 4, 2, 1, drop=True)
+        
+        self.decode_4_0 = DecoderNode(512, 512, 4, 2, 1)
+        self.decode_3_1 = DecoderNode(1024, 512, 4, 2, 1)
+        self.decode_2_2 = DecoderNode(1024, 256, 4, 2, 1, drop=False)
+        self.decode_1_3 = DecoderNode(512, 128, 4, 2, 1, drop=False)
+        self.decode_0_4 = DecoderNode(256, 64, 4, 2, 1, drop=False)
+        
+        self.gate = nn.Sequential(
+            nn.ConvTranspose2d(128, 3,  4, 2, 1),
+            nn.Tanh()
+        )
+
+
+    def forward(self, input):
+        # input -> 3 x 256 x 256
+        e_0_0 = self.encode_0_0(input)   # [1, 64, 128, 128]
+        e_1_0 = self.encode_1_0(e_0_0)   # [1, 128, 64, 64]
+        e_2_0 = self.encode_2_0(e_1_0)   # [1, 256, 32, 32]
+        e_3_0 = self.encode_3_0(e_2_0)   # [1, 512, 16, 16]
+        e_4_0 = self.encode_4_0(e_3_0)
+        
+        b = self.bottleneck(e_4_0)
+        
+        d_4_0 = self.decode_4_0(b, e_4_0)
+        
+        i_3_1 = self.internal_3_1(e_3_0, e_4_0)
+        d_3_1 = self.decode_3_1(d_4_0, i_3_1)
+        
+        i_2_1 = self.internal_2_1(e_2_0, e_3_0)
+        i_2_2 = self.internal_2_2(i_2_1, i_3_1)
+        d_2_2 = self.decode_2_2(d_3_1, i_2_2)
+        
+        i_1_1 = self.internal_1_1(e_1_0, e_2_0)
+        i_1_2 = self.internal_1_2(i_1_1, i_2_1)
+        i_1_3 = self.internal_1_3(i_1_2, i_2_2)
+        d_1_3 = self.decode_1_3(d_2_2, i_1_3)
+        
+        i_0_1 = self.internal_0_1(e_0_0, e_1_0)
+        i_0_2 = self.internal_0_2(i_0_1, i_1_1)
+        i_0_3 = self.internal_0_3(i_0_2, i_1_2)
+        i_0_4 = self.internal_0_4(i_0_3, i_1_3)
+        d_0_4 = self.decode_0_4(d_1_3, i_0_4)
+        
+        return self.gate(d_0_4)
 
 class Identity(nn.Module):
     def forward(self, x):
@@ -154,6 +284,8 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
         net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
+    elif netG == 'unet_plus':
+        net = UNet_Plus_Generator_()
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
